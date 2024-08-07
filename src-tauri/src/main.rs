@@ -2,10 +2,12 @@ use chrono::Local;
 use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use tauri::Manager;
+use tauri::api::path::app_data_dir;
+use std::fs;
 
 #[derive(Serialize, Deserialize)]
 struct ConnectionLog {
@@ -21,41 +23,43 @@ struct AppState {
 fn main() {
     // Set up system tray
     let tray_menu = tauri::SystemTrayMenu::new()
-        .add_item(tauri::CustomMenuItem::new("open", "Open"))
+        .add_item(tauri::CustomMenuItem::new("toggle", "Show/Hide"))
         .add_item(tauri::CustomMenuItem::new("quit", "Quit"));
     let system_tray = tauri::SystemTray::new().with_menu(tray_menu);
 
     tauri::Builder::default()
         .system_tray(system_tray)
         .setup(|app| {
-            let db = Connection::open("connections.db")?;
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS connections (
-                    date TEXT PRIMARY KEY,
-                    earliest TEXT NOT NULL,
-                    latest TEXT NOT NULL
-                )",
-                [],
-            )?;
-
+            let app_handle = app.handle();
+            let db = create_db_connection(&app_handle)?;
             app.manage(AppState { db: Mutex::new(db) });
 
             // Start background task
-            let app_handle = app.handle();
             std::thread::spawn(move || loop {
+                let now = Local::now();
+                println!(
+                    "Checking WiFi connection at {}",
+                    now.format("%Y-%m-%d %H:%M")
+                );
                 if let Err(e) = check_wifi_connection(app_handle.state()) {
                     eprintln!("Error checking WiFi connection: {}", e);
                 }
-                thread::sleep(Duration::from_secs(60));
+                thread::sleep(Duration::from_secs(30));
             });
 
             Ok(())
         })
         .on_system_tray_event(|app, event| match event {
             tauri::SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
-                "open" => {
-                    if let Some(window) = app.get_window("main") {
+                "toggle" => {
+                    let window = app.get_window("main").unwrap();
+                    if window.is_visible().unwrap() {
+                        window.hide().unwrap();
+                    } else {
                         window.show().unwrap();
+                        window.set_focus().unwrap();
+                        #[cfg(target_os = "macos")]
+                        window.set_skip_taskbar(false).unwrap();
                     }
                 }
                 "quit" => {
@@ -65,29 +69,63 @@ fn main() {
             },
             _ => {}
         })
+        .on_window_event(|event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
+                let window = event.window();
+                window.hide().unwrap();
+                #[cfg(target_os = "macos")]
+                window.set_skip_taskbar(true).unwrap();
+                api.prevent_close();
+            }
+        })
         .invoke_handler(tauri::generate_handler![get_connections])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| match event {
+            _ => {}
+        });
+}
+
+
+
+fn create_db_connection(
+    app_handle: &tauri::AppHandle,
+) -> Result<Connection, Box<dyn std::error::Error>> {
+    let app_data_dir = app_data_dir(&app_handle.config()).expect("Failed to get app data dir");
+    fs::create_dir_all(&app_data_dir)?;
+    let db_path = app_data_dir.join("connections.db");
+
+    let db = Connection::open(db_path)?;
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS connections (
+            date TEXT PRIMARY KEY,
+            earliest TEXT NOT NULL,
+            latest TEXT NOT NULL
+        )",
+        [],
+    )?;
+    Ok(db)
+}
+
+fn get_connection_log(db: MutexGuard<Connection>) -> Result<Vec<ConnectionLog>> {
+    let mut stmt =
+        db.prepare("SELECT date, earliest, latest FROM connections ORDER BY date DESC")?;
+    let logs = stmt.query_map([], |row| {
+        Ok(ConnectionLog {
+            date: row.get(0)?,
+            earliest: row.get(1)?,
+            latest: row.get(2)?,
+        })
+    })?;
+
+    logs.collect()
 }
 
 #[tauri::command]
 fn get_connections(state: tauri::State<AppState>) -> Result<Vec<ConnectionLog>, String> {
+    // return Ok(vec![]);
     let db = state.db.lock().unwrap();
-    let mut stmt = db
-        .prepare("SELECT date, earliest, latest FROM connections ORDER BY date DESC")
-        .unwrap();
-    let logs = stmt
-        .query_map([], |row| {
-            Ok(ConnectionLog {
-                date: row.get(0)?,
-                earliest: row.get(1)?,
-                latest: row.get(2)?,
-            })
-        })
-        .unwrap();
-
-    logs.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())
+    get_connection_log(db).map_err(|e| e.to_string())
 }
 
 fn get_current_wifi_ssid() -> Option<String> {
@@ -130,7 +168,7 @@ fn insert_connection(state: &tauri::State<AppState>) -> Result<(), String> {
 }
 
 fn check_wifi_connection(state: tauri::State<AppState>) -> Result<(), String> {
-    let target_ssid = "VM5CAC70";
+    let target_ssid = "eduroam";
     if let Some(current_ssid) = get_current_wifi_ssid() {
         println!("Current WiFi SSID: {}", current_ssid);
         if current_ssid == target_ssid {
